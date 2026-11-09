@@ -254,7 +254,59 @@ export function attachGatewayWsMessageHandler(params: {
 
         const device = connectParams.device;
         let devicePublicKey: string | null = null;
-        if (!device) {
+        const hasSharedAuth = Boolean(connectParams.auth?.token || connectParams.auth?.password);
+
+        const authResult = await authorizeGatewayConnect({
+          auth: resolvedAuth,
+          connectAuth: connectParams.auth,
+          req: upgradeReq,
+        });
+        let authOk = authResult.ok;
+        let authMethod = authResult.method ?? "none";
+        const sharedAuthResult = hasSharedAuth
+          ? await authorizeGatewayConnect({
+              auth: { ...resolvedAuth, allowTailscale: false },
+              connectAuth: connectParams.auth,
+              req: upgradeReq,
+            })
+          : null;
+        const sharedAuthOk =
+          sharedAuthResult?.ok === true &&
+          (sharedAuthResult.method === "token" || sharedAuthResult.method === "password");
+        const rejectUnauthorized = () => {
+          setHandshakeState("failed");
+          logWsControl.warn(
+            `unauthorized conn=${connId} remote=${remoteAddr ?? "?"} client=${clientLabel} ${connectParams.client.mode} v${connectParams.client.version}`,
+          );
+          const authProvided = connectParams.auth?.token
+            ? "token"
+            : connectParams.auth?.password
+              ? "password"
+              : "none";
+          setCloseCause("unauthorized", {
+            authMode: resolvedAuth.mode,
+            authProvided,
+            authReason: authResult.reason,
+            allowTailscale: resolvedAuth.allowTailscale,
+            client: connectParams.client.id,
+            clientDisplayName: connectParams.client.displayName,
+            mode: connectParams.client.mode,
+            version: connectParams.client.version,
+          });
+          send({
+            type: "res",
+            id: frame.id,
+            ok: false,
+            error: errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"),
+          });
+          close(1008, "unauthorized");
+        };
+        // Allow shared-secret authenticated connections (e.g., control-ui) to skip device identity
+        if (!device && !sharedAuthOk) {
+          if (!authOk && hasSharedAuth) {
+            rejectUnauthorized();
+            return;
+          }
           setHandshakeState("failed");
           setCloseCause("device-required", {
             client: connectParams.client.id,
@@ -420,14 +472,7 @@ export function attachGatewayWsMessageHandler(params: {
           }
         }
 
-        const authResult = await authorizeGatewayConnect({
-          auth: resolvedAuth,
-          connectAuth: connectParams.auth,
-          req: upgradeReq,
-        });
-        let authOk = authResult.ok;
-        let authMethod = authResult.method ?? "none";
-        if (!authOk && connectParams.auth?.token) {
+        if (!authOk && connectParams.auth?.token && device) {
           const tokenCheck = await verifyDeviceToken({
             deviceId: device.id,
             token: connectParams.auth.token,
@@ -440,32 +485,7 @@ export function attachGatewayWsMessageHandler(params: {
           }
         }
         if (!authOk) {
-          setHandshakeState("failed");
-          logWsControl.warn(
-            `unauthorized conn=${connId} remote=${remoteAddr ?? "?"} client=${clientLabel} ${connectParams.client.mode} v${connectParams.client.version}`,
-          );
-          const authProvided = connectParams.auth?.token
-            ? "token"
-            : connectParams.auth?.password
-              ? "password"
-              : "none";
-          setCloseCause("unauthorized", {
-            authMode: resolvedAuth.mode,
-            authProvided,
-            authReason: authResult.reason,
-            allowTailscale: resolvedAuth.allowTailscale,
-            client: connectParams.client.id,
-            clientDisplayName: connectParams.client.displayName,
-            mode: connectParams.client.mode,
-            version: connectParams.client.version,
-          });
-          send({
-            type: "res",
-            id: frame.id,
-            ok: false,
-            error: errorShape(ErrorCodes.INVALID_REQUEST, "unauthorized"),
-          });
-          close(1008, "unauthorized");
+          rejectUnauthorized();
           return;
         }
 
